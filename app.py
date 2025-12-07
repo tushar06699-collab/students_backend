@@ -158,6 +158,11 @@ def download_format():
 
     return send_file(filepath, as_attachment=True)
 
+@app.route("/", methods=["GET"])
+def home():
+    return "Backend Running", 200
+
+
 # ------------------ RUN APP ------------------
 if __name__ == "__main__":
     app.run(debug=True)
