@@ -3,5 +3,5 @@ flask-cors
 pandas
 openpyxl
 pymongo
-gunicorn
 cloudinary
+gunicorn
