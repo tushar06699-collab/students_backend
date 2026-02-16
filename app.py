@@ -55,6 +55,45 @@ def upload_to_cloudinary(image_url):
         print("Image upload error:", e)
         return ""
 
+
+
+def normalize_admission_no(value):
+    """Normalize admission number so 1001 and 1001.0 map to same key."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return ""
+
+    # Excel often sends numeric IDs as float text (e.g. "1001.0")
+    if text.endswith(".0"):
+        text = text[:-2]
+
+    return text.strip()
+
+
+def build_zip_image_map(extract_dir):
+    """Map normalized admission_no -> image path (supports nested folders + any case extension)."""
+    image_map = {}
+    allowed = {".jpg", ".jpeg", ".png", ".webp"}
+
+    for root, _, files in os.walk(extract_dir):
+        for file_name in files:
+            base, ext = os.path.splitext(file_name)
+            if ext.lower() not in allowed:
+                continue
+
+            key = normalize_admission_no(base)
+            if not key:
+                continue
+
+            full_path = os.path.join(root, file_name)
+            # First match wins, avoids random overwrite
+            if key not in image_map:
+                image_map[key] = full_path
+
+    return image_map
+
 # ================= IMPORT EXCEL + ZIP IMAGES =================
 @app.route("/import_excel_with_images", methods=["POST"])
 def import_excel_with_images():
@@ -67,51 +106,64 @@ def import_excel_with_images():
     df = pd.read_excel(excel)
     extract_dir = tempfile.mkdtemp()
 
-    if zip_file:
-        with zipfile.ZipFile(zip_file, "r") as zip_ref:
-            zip_ref.extractall(extract_dir)
+    matched_photos = 0
+    image_map = {}
 
-    students = []
+    try:
+        if zip_file and zip_file.filename:
+            with zipfile.ZipFile(zip_file, "r") as zip_ref:
+                zip_ref.extractall(extract_dir)
+            image_map = build_zip_image_map(extract_dir)
 
-    for _, row in df.iterrows():
-        admission_no = str(row.get("admission_no", "")).strip()
-        photo_url = ""
+        students = []
 
-        # find image by admission_no
-        for ext in ["jpg", "jpeg", "png"]:
-            img_path = os.path.join(extract_dir, f"{admission_no}.{ext}")
-            if os.path.exists(img_path):
-                res = cloudinary.uploader.upload(
-                    img_path,
-                    folder="school_students"
-                )
-                photo_url = res.get("secure_url", "")
-                break
+        for _, row in df.iterrows():
+            admission_no = normalize_admission_no(row.get("admission_no", ""))
+            photo_url = ""
 
-        students.append({
-            "admission_no": admission_no,
-            "rollno": str(row.get("rollno", "")).strip(),
-            "panno": str(row.get("panno", "")).strip(),
-            "student_name": str(row.get("student_name", "")).strip(),
-            "father_name": str(row.get("father_name", "")).strip(),
-            "mother_name": str(row.get("mother_name", "")).strip(),
-            "class_name": str(row.get("class_name", "")).strip(),
-            "section": str(row.get("section", "")).strip(),
-            "gender": str(row.get("gender", "")).strip(),
-            "dob": str(row.get("dob", "")).strip(),
-            "aadharno": str(row.get("aadharno", "")).strip(),
-            "parent_mobile": str(row.get("parent_mobile", "")).strip(),
-            "parent_email": str(row.get("parent_email", "")).strip(),
-            "address": str(row.get("address", "")).strip(),
-            "session": str(row.get("session", "")).strip(),
-            "photo_url": photo_url
+            img_path = image_map.get(admission_no)
+            if img_path and os.path.exists(img_path):
+                try:
+                    res = cloudinary.uploader.upload(
+                        img_path,
+                        folder="school_students"
+                    )
+                    photo_url = res.get("secure_url", "")
+                    if photo_url:
+                        matched_photos += 1
+                except Exception as e:
+                    print(f"Photo upload error for admission_no={admission_no}:", e)
+
+            students.append({
+                "admission_no": admission_no,
+                "rollno": normalize_admission_no(row.get("rollno", "")),
+                "panno": str(row.get("panno", "")).strip(),
+                "student_name": str(row.get("student_name", "")).strip(),
+                "father_name": str(row.get("father_name", "")).strip(),
+                "mother_name": str(row.get("mother_name", "")).strip(),
+                "class_name": str(row.get("class_name", "")).strip(),
+                "section": str(row.get("section", "")).strip(),
+                "gender": str(row.get("gender", "")).strip(),
+                "dob": str(row.get("dob", "")).strip(),
+                "aadharno": normalize_admission_no(row.get("aadharno", "")),
+                "parent_mobile": normalize_admission_no(row.get("parent_mobile", "")),
+                "parent_email": str(row.get("parent_email", "")).strip(),
+                "address": str(row.get("address", "")).strip(),
+                "session": str(row.get("session", "")).strip(),
+                "photo_url": photo_url
+            })
+
+        if students:
+            students_col.insert_many(students)
+
+        return jsonify({
+            "message": f"Imported {len(students)} students successfully",
+            "students_imported": len(students),
+            "photos_matched": matched_photos,
+            "photos_missing": max(0, len(students) - matched_photos)
         })
-
-    if students:
-        students_col.insert_many(students)
-
-    shutil.rmtree(extract_dir)
-    return jsonify({"message": "Imported with images successfully"})
+    finally:
+        shutil.rmtree(extract_dir, ignore_errors=True)
 
 # ================= GET ALL STUDENTS =================
 
