@@ -240,9 +240,33 @@ def import_excel():
 
     return jsonify({"message": "Students imported successfully"})
 
+
+
+@app.route("/students/by-admission/<admission_no>", methods=["GET"])
+def get_student_by_admission(admission_no):
+    admission_no = str(admission_no or "").strip()
+    if not admission_no:
+        return jsonify({"success": False, "message": "Missing admission number"}), 400
+
+    student = students_col.find_one({"admission_no": admission_no})
+    if not student:
+        return jsonify({"success": False, "message": "Student not found"}), 404
+
+    student["_id"] = str(student["_id"])
+    return jsonify({"success": True, "student": student})
+
 @app.route("/students", methods=["GET"])
 def get_students():
-    students = list(students_col.find({}))
+    session = str(request.args.get("session", "")).strip()
+    class_name = str(request.args.get("class_name", request.args.get("class", ""))).strip()
+
+    q = {}
+    if session:
+        q["session"] = session
+    if class_name:
+        q["class_name"] = class_name
+
+    students = list(students_col.find(q))
     for s in students:
         s["_id"] = str(s["_id"])
     return jsonify(students)
@@ -303,6 +327,34 @@ def download_format():
     file_path = "student_import_format.xlsx"
     wb.save(file_path)
     return send_file(file_path, as_attachment=True)
+@app.route("/portal/student/<student_id>", methods=["GET"])
+def portal_get_student(student_id):
+    try:
+        student = students_col.find_one({"_id": ObjectId(student_id)})
+
+        if not student:
+            return jsonify({"success": False, "message": "Student not found"}), 404
+
+        student["_id"] = str(student["_id"])
+
+        return jsonify({
+            "success": True,
+            "student": {
+                "id": student["_id"],
+                "name": student.get("student_name", ""),
+                "class_name": student.get("class_name", ""),
+                "section": student.get("section", ""),
+                "roll": student.get("rollno", ""),
+                "photo_url": student.get("photo_url", ""),
+                "session": student.get("session", ""),
+                "eligible": True,
+                "release_rollno": True,
+                "release_result": True
+            }
+        })
+
+    except Exception as e:
+        return jsonify({"success": False, "message": "Invalid ID"}), 400
 
 # ================= HOME =================
 @app.route("/", methods=["GET"])
