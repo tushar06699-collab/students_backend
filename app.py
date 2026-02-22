@@ -29,6 +29,13 @@ client = MongoClient(MONGO_URI)
 db = client["school_erp"]
 students_col = db["students"]
 
+
+def to_bool(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "on"}
+
 # ================= IMAGE FROM URL =================
 def upload_to_cloudinary(image_url):
     if not image_url:
@@ -150,6 +157,7 @@ def import_excel_with_images():
                 "parent_email": str(row.get("parent_email", "")).strip(),
                 "address": str(row.get("address", "")).strip(),
                 "session": str(row.get("session", "")).strip(),
+                "new_admission": to_bool(row.get("new_admission", False)),
                 "photo_url": photo_url
             })
 
@@ -196,6 +204,7 @@ def add_student():
         "parent_mobile": form.get("parent_mobile", ""),
         "parent_email": form.get("parent_email", ""),
         "address": form.get("address", ""),
+        "new_admission": to_bool(form.get("new_admission", "false")),
         "photo_url": photo_url
     }
 
@@ -231,6 +240,7 @@ def import_excel():
             "parent_mobile": str(row.get("parent_mobile", "")).strip(),
             "parent_email": str(row.get("parent_email", "")).strip(),
             "address": str(row.get("address", "")).strip(),
+            "new_admission": to_bool(row.get("new_admission", False)),
             "photo_url": cloud_img,
             "session": str(row.get("session", "")).strip()
         })
