@@ -284,11 +284,41 @@ def get_students():
 
 @app.route("/students/<id>", methods=["PUT"])
 def update_student(id):
-    students_col.update_one(
-        {"_id":ObjectId(id)},
-        {"$set":request.json}
-    )
-    return jsonify({"success":True})
+    try:
+        update_data = {}
+
+        # Support both JSON updates and multipart form updates with photo upload.
+        if request.content_type and "multipart/form-data" in request.content_type:
+            form = request.form
+            photo = request.files.get("photo")
+
+            fields = [
+                "admission_no", "rollno", "panno", "student_name", "father_name", "mother_name",
+                "class_name", "section", "gender", "dob", "session", "aadharno",
+                "parent_mobile", "parent_email", "address", "photo_url", "new_admission"
+            ]
+            for f in fields:
+                if f in form:
+                    update_data[f] = form.get(f, "")
+
+            if "new_admission" in update_data:
+                update_data["new_admission"] = to_bool(update_data["new_admission"])
+
+            if photo:
+                res = cloudinary.uploader.upload(photo, folder="school_students")
+                update_data["photo_url"] = res.get("secure_url", "")
+        else:
+            update_data = request.json or {}
+            if "new_admission" in update_data:
+                update_data["new_admission"] = to_bool(update_data["new_admission"])
+
+        students_col.update_one(
+            {"_id": ObjectId(id)},
+            {"$set": update_data}
+        )
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 400
 
 @app.route("/students/<id>", methods=["GET"])
 def get_student(id):
