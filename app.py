@@ -36,6 +36,45 @@ def to_bool(value):
     text = str(value or "").strip().lower()
     return text in {"1", "true", "yes", "y", "on"}
 
+
+def session_variants(session_value):
+    """
+    Build tolerant session variants so queries match common formats:
+    2025_26, 2025-26, 2025/26, 2025 26, 2025_2026
+    """
+    s = str(session_value or "").strip()
+    if not s:
+        return []
+
+    variants = {s}
+    compact = s.replace(" ", "")
+    variants.add(compact)
+    variants.add(compact.replace("-", "_"))
+    variants.add(compact.replace("/", "_"))
+    variants.add(compact.replace("_", "-"))
+    variants.add(compact.replace("_", "/"))
+    variants.add(compact.replace("-", "/"))
+    variants.add(compact.replace("/", "-"))
+
+    # Try start/end year normalization if pattern contains a separator.
+    for sep in ["_", "-", "/", " "]:
+        if sep in s:
+            parts = [p for p in s.split(sep) if p]
+            if len(parts) >= 2 and parts[0].isdigit():
+                start = parts[0]
+                end = parts[1]
+                if len(end) == 2:
+                    full_end = start[:2] + end
+                    variants.add(f"{start}_{end}")
+                    variants.add(f"{start}-{end}")
+                    variants.add(f"{start}/{end}")
+                    variants.add(f"{start}_{full_end}")
+                    variants.add(f"{start}-{full_end}")
+                    variants.add(f"{start}/{full_end}")
+                break
+
+    return list(variants)
+
 # ================= IMAGE FROM URL =================
 def upload_to_cloudinary(image_url):
     if not image_url:
@@ -271,12 +310,25 @@ def get_students():
     class_name = str(request.args.get("class_name", request.args.get("class", ""))).strip()
 
     q = {}
-    if session:
-        q["session"] = session
     if class_name:
         q["class_name"] = class_name
 
-    students = list(students_col.find(q))
+    # Primary: exact session filter when provided.
+    # Compatibility fallback: many legacy rows may have missing/old session values.
+    students = []
+    if session:
+        q_session = dict(q)
+        variants = session_variants(session)
+        q_session["session"] = {"$in": variants} if variants else session
+        students = list(students_col.find(q_session))
+
+        # If session-filtered dataset is too small, fallback to all records for the class.
+        # This keeps older frontend pages working when session data is inconsistent.
+        if len(students) <= 1:
+            students = list(students_col.find(q))
+    else:
+        students = list(students_col.find(q))
+
     for s in students:
         s["_id"] = str(s["_id"])
     return jsonify(students)
