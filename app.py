@@ -28,6 +28,7 @@ MONGO_URI = "mongodb+srv://school_students:Tushar2007@cluster0.upoywck.mongodb.n
 client = MongoClient(MONGO_URI)
 db = client["school_erp"]
 students_col = db["students"]
+teachers_col = db["teachers"]
 
 
 def to_bool(value):
@@ -118,6 +119,21 @@ def normalize_admission_no(value):
     return text.strip()
 
 
+def normalize_teacher_code(value):
+    """Normalize teacher code to 4 digits when numeric."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return ""
+    if text.endswith(".0"):
+        text = text[:-2]
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if digits:
+        return digits.zfill(4) if len(digits) <= 4 else digits
+    return text
+
+
 def build_zip_image_map(extract_dir):
     """Map normalized admission_no -> image path (supports nested folders + any case extension)."""
     image_map = {}
@@ -135,6 +151,26 @@ def build_zip_image_map(extract_dir):
 
             full_path = os.path.join(root, file_name)
             # First match wins, avoids random overwrite
+            if key not in image_map:
+                image_map[key] = full_path
+
+    return image_map
+
+
+def build_zip_image_map_with_normalizer(extract_dir, normalizer):
+    """Map normalized key -> image path using any custom normalizer."""
+    image_map = {}
+    allowed = {".jpg", ".jpeg", ".png", ".webp"}
+
+    for root, _, files in os.walk(extract_dir):
+        for file_name in files:
+            base, ext = os.path.splitext(file_name)
+            if ext.lower() not in allowed:
+                continue
+            key = normalizer(base)
+            if not key:
+                continue
+            full_path = os.path.join(root, file_name)
             if key not in image_map:
                 image_map[key] = full_path
 
@@ -395,6 +431,225 @@ def delete_student(id):
 def delete_all_students():
     students_col.delete_many({})
     return jsonify({"message": "All students deleted"})
+
+# ================= ADD TEACHER (FORM + IMAGE) =================
+@app.route("/teachers", methods=["POST"])
+def add_teacher():
+    form = request.form
+    photo = request.files.get("photo")
+    teacher_code = normalize_teacher_code(form.get("teacher_code", ""))
+    if not teacher_code or not teacher_code.isdigit() or len(teacher_code) != 4:
+        return jsonify({"error": "teacher_code must be exactly 4 digits"}), 400
+
+    photo_url = ""
+    if photo:
+        res = cloudinary.uploader.upload(photo, folder="school_teachers")
+        photo_url = res.get("secure_url", "")
+
+    teacher = {
+        "teacher_code": teacher_code,
+        "employee_id": form.get("employee_id", "").strip(),
+        "teacher_name": form.get("teacher_name", "").strip(),
+        "father_name": form.get("father_name", "").strip(),
+        "mother_name": form.get("mother_name", "").strip(),
+        "gender": form.get("gender", "").strip(),
+        "dob": form.get("dob", "").strip(),
+        "joining_date": form.get("joining_date", "").strip(),
+        "qualification": form.get("qualification", "").strip(),
+        "designation": form.get("designation", "").strip(),
+        "subject": form.get("subject", "").strip(),
+        "mobile": form.get("mobile", "").strip(),
+        "email": form.get("email", "").strip(),
+        "address": form.get("address", "").strip(),
+        "session": form.get("session", "").strip(),
+        "photo_url": photo_url
+    }
+
+    teachers_col.insert_one(teacher)
+    return jsonify({"message": "Teacher added successfully"})
+
+
+@app.route("/teachers/import_excel_with_images", methods=["POST"])
+def import_teachers_excel_with_images():
+    if "excel" not in request.files:
+        return jsonify({"error": "Excel file required"}), 400
+
+    excel = request.files["excel"]
+    zip_file = request.files.get("images")
+
+    df = pd.read_excel(excel)
+    extract_dir = tempfile.mkdtemp()
+    matched_photos = 0
+    image_map = {}
+
+    try:
+        if zip_file and zip_file.filename:
+            with zipfile.ZipFile(zip_file, "r") as zip_ref:
+                zip_ref.extractall(extract_dir)
+            image_map = build_zip_image_map_with_normalizer(extract_dir, normalize_teacher_code)
+
+        teachers = []
+        for _, row in df.iterrows():
+            teacher_code = normalize_teacher_code(row.get("teacher_code", ""))
+            photo_url = ""
+
+            img_path = image_map.get(teacher_code)
+            if img_path and os.path.exists(img_path):
+                try:
+                    res = cloudinary.uploader.upload(img_path, folder="school_teachers")
+                    photo_url = res.get("secure_url", "")
+                    if photo_url:
+                        matched_photos += 1
+                except Exception as e:
+                    print(f"Teacher photo upload error for teacher_code={teacher_code}:", e)
+
+            teachers.append({
+                "teacher_code": teacher_code,
+                "employee_id": str(row.get("employee_id", "")).strip(),
+                "teacher_name": str(row.get("teacher_name", "")).strip(),
+                "father_name": str(row.get("father_name", "")).strip(),
+                "mother_name": str(row.get("mother_name", "")).strip(),
+                "gender": str(row.get("gender", "")).strip(),
+                "dob": str(row.get("dob", "")).strip(),
+                "joining_date": str(row.get("joining_date", "")).strip(),
+                "qualification": str(row.get("qualification", "")).strip(),
+                "designation": str(row.get("designation", "")).strip(),
+                "subject": str(row.get("subject", "")).strip(),
+                "mobile": normalize_admission_no(row.get("mobile", "")),
+                "email": str(row.get("email", "")).strip(),
+                "address": str(row.get("address", "")).strip(),
+                "session": str(row.get("session", "")).strip(),
+                "photo_url": photo_url
+            })
+
+        if teachers:
+            teachers_col.insert_many(teachers)
+
+        return jsonify({
+            "message": f"Imported {len(teachers)} teachers successfully",
+            "teachers_imported": len(teachers),
+            "photos_matched": matched_photos,
+            "photos_missing": max(0, len(teachers) - matched_photos)
+        })
+    finally:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+
+
+@app.route("/teachers/download_format", methods=["GET"])
+def download_teacher_format():
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Teacher Import Format"
+
+    headers = [
+        "teacher_code", "employee_id", "teacher_name", "father_name", "mother_name",
+        "gender", "dob", "joining_date", "qualification", "designation", "subject",
+        "mobile", "email", "address", "session"
+    ]
+    ws.append(headers)
+
+    dv_gender = DataValidation(type="list", formula1='"Male,Female,Other"')
+    ws.add_data_validation(dv_gender)
+    dv_gender.add("F2:F1000")
+
+    file_path = "teacher_import_format.xlsx"
+    wb.save(file_path)
+    return send_file(file_path, as_attachment=True)
+
+
+# ================= GET ALL TEACHERS =================
+@app.route("/teachers", methods=["GET"])
+def get_teachers():
+    session = str(request.args.get("session", "")).strip()
+    designation = str(request.args.get("designation", "")).strip()
+    subject = str(request.args.get("subject", "")).strip()
+
+    q = {}
+    if designation:
+        q["designation"] = designation
+    if subject:
+        q["subject"] = subject
+
+    teachers = []
+    if session:
+        q_session = dict(q)
+        variants = session_variants(session)
+        q_session["session"] = {"$in": variants} if variants else session
+        teachers = list(teachers_col.find(q_session))
+        if len(teachers) <= 1:
+            teachers = list(teachers_col.find(q))
+    else:
+        teachers = list(teachers_col.find(q))
+
+    for t in teachers:
+        t["_id"] = str(t["_id"])
+    return jsonify(teachers)
+
+
+# ================= GET SINGLE TEACHER =================
+@app.route("/teachers/<id>", methods=["GET"])
+def get_teacher(id):
+    try:
+        teacher = teachers_col.find_one({"_id": ObjectId(id)})
+        if not teacher:
+            return jsonify({"error": "Teacher not found"}), 404
+        teacher["_id"] = str(teacher["_id"])
+        return jsonify(teacher)
+    except Exception:
+        return jsonify({"error": "Invalid ID"}), 400
+
+
+# ================= UPDATE TEACHER =================
+@app.route("/teachers/<id>", methods=["PUT"])
+def update_teacher(id):
+    try:
+        update_data = {}
+
+        if request.content_type and "multipart/form-data" in request.content_type:
+            form = request.form
+            photo = request.files.get("photo")
+
+            fields = [
+                "teacher_code", "employee_id", "teacher_name", "father_name", "mother_name",
+                "gender", "dob", "joining_date", "qualification", "designation",
+                "subject", "mobile", "email", "address", "session", "photo_url"
+            ]
+            for f in fields:
+                if f in form:
+                    update_data[f] = form.get(f, "").strip()
+            if "teacher_code" in update_data:
+                update_data["teacher_code"] = normalize_teacher_code(update_data["teacher_code"])
+                if update_data["teacher_code"] and (not update_data["teacher_code"].isdigit() or len(update_data["teacher_code"]) != 4):
+                    return jsonify({"success": False, "error": "teacher_code must be exactly 4 digits"}), 400
+
+            if photo:
+                res = cloudinary.uploader.upload(photo, folder="school_teachers")
+                update_data["photo_url"] = res.get("secure_url", "")
+        else:
+            update_data = request.json or {}
+            if "teacher_code" in update_data:
+                update_data["teacher_code"] = normalize_teacher_code(update_data.get("teacher_code", ""))
+                if update_data["teacher_code"] and (not update_data["teacher_code"].isdigit() or len(update_data["teacher_code"]) != 4):
+                    return jsonify({"success": False, "error": "teacher_code must be exactly 4 digits"}), 400
+
+        teachers_col.update_one({"_id": ObjectId(id)}, {"$set": update_data})
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+# ================= DELETE TEACHER =================
+@app.route("/teachers/<id>", methods=["DELETE"])
+def delete_teacher(id):
+    teachers_col.delete_one({"_id": ObjectId(id)})
+    return jsonify({"message": "Teacher deleted"})
+
+
+# ================= DELETE ALL TEACHERS =================
+@app.route("/teachers/delete_all", methods=["DELETE"])
+def delete_all_teachers():
+    teachers_col.delete_many({})
+    return jsonify({"message": "All teachers deleted"})
 
 # ================= DOWNLOAD EXCEL FORMAT =================
 @app.route("/download_format", methods=["GET"])
