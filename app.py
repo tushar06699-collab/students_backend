@@ -119,6 +119,11 @@ def normalize_admission_no(value):
     return text.strip()
 
 
+def normalize_photo_id(value):
+    """Normalize photo_id similar to admission numbers."""
+    return normalize_admission_no(value)
+
+
 def normalize_teacher_code(value):
     """Normalize teacher code to 4 digits when numeric."""
     if value is None:
@@ -201,9 +206,10 @@ def import_excel_with_images():
 
         for _, row in df.iterrows():
             admission_no = normalize_admission_no(row.get("admission_no", ""))
+            photo_id = normalize_photo_id(row.get("photo_id", ""))
             photo_url = ""
 
-            img_path = image_map.get(admission_no)
+            img_path = image_map.get(photo_id) or image_map.get(admission_no)
             if img_path and os.path.exists(img_path):
                 try:
                     res = cloudinary.uploader.upload(
@@ -217,6 +223,7 @@ def import_excel_with_images():
                     print(f"Photo upload error for admission_no={admission_no}:", e)
 
             students.append({
+                "photo_id": photo_id,
                 "admission_no": admission_no,
                 "rollno": normalize_admission_no(row.get("rollno", "")),
                 "panno": str(row.get("panno", "")).strip(),
@@ -266,6 +273,7 @@ def add_student():
 
     student = {
         "admission_no": form.get("admission_no", ""),
+        "photo_id": form.get("photo_id", ""),
         "rollno": form.get("rollno", ""),
         "panno": form.get("panno", ""),
         "student_name": form.get("student_name", ""),
@@ -301,6 +309,7 @@ def import_excel():
         cloud_img = upload_to_cloudinary(row.get("photo_url", ""))
 
         students.append({
+            "photo_id": normalize_photo_id(row.get("photo_id", "")),
             "admission_no": str(row.get("admission_no", "")).strip(),
             "rollno": str(row.get("rollno", "")).strip(),
             "panno": str(row.get("panno", "")).strip(),
@@ -659,7 +668,7 @@ def download_format():
     ws.title = "Student Import Format"
 
     headers = [
-        "admission_no", "rollno", "panno", "student_name",
+        "photo_id", "admission_no", "rollno", "panno", "student_name",
         "father_name", "mother_name", "class_name", "section",
         "dob", "gender", "aadharno",
         "parent_mobile", "parent_email", "address",
