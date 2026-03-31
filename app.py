@@ -367,10 +367,13 @@ def get_students():
         q_session["session"] = {"$in": variants} if variants else session
         students = list(students_col.find(q_session))
 
-        # If session-filtered dataset is too small, fallback to all records for the class.
-        # This keeps older frontend pages working when session data is inconsistent.
-        if len(students) <= 1:
-            students = list(students_col.find(q))
+        # Optional strict mode: never fallback to all sessions.
+        strict = str(request.args.get("strict", "")).strip().lower() in {"1","true","yes","y","on"}
+        if not strict:
+            # If session-filtered dataset is too small, fallback to all records for the class.
+            # This keeps older frontend pages working when session data is inconsistent.
+            if len(students) <= 1:
+                students = list(students_col.find(q))
     else:
         students = list(students_col.find(q))
 
@@ -454,6 +457,9 @@ def add_teacher():
     if photo:
         res = cloudinary.uploader.upload(photo, folder="school_teachers")
         photo_url = res.get("secure_url", "")
+    else:
+        # allow direct URL copy when no file is uploaded
+        photo_url = form.get("photo_url", "").strip()
 
     teacher = {
         "teacher_code": teacher_code,
