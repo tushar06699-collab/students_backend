@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from datetime import datetime
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -29,6 +30,7 @@ client = MongoClient(MONGO_URI)
 db = client["school_erp"]
 students_col = db["students"]
 teachers_col = db["teachers"]
+student_edit_requests_col = db["student_edit_requests"]
 
 
 def to_bool(value):
@@ -419,6 +421,149 @@ def update_student(id):
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 400
+
+
+# ================= STUDENT EDIT REQUESTS =================
+EDITABLE_FIELDS = {
+    "photo_id", "admission_no", "rollno", "panno", "student_name", "father_name",
+    "mother_name", "class_name", "section", "gender", "dob", "session",
+    "aadharno", "parent_mobile", "parent_email", "address", "photo_url", "new_admission"
+}
+PHOTO_DATA_FIELD = "photo_data"
+
+
+def filter_edit_changes(changes):
+    if not isinstance(changes, dict):
+        return {}
+    cleaned = {}
+    for k, v in changes.items():
+        if k in EDITABLE_FIELDS:
+            cleaned[k] = v
+        if k == PHOTO_DATA_FIELD:
+            cleaned[k] = v
+    if "new_admission" in cleaned:
+        cleaned["new_admission"] = to_bool(cleaned["new_admission"])
+    return cleaned
+
+
+@app.route("/student-edit-requests", methods=["POST"])
+def create_student_edit_request():
+    data = request.json or {}
+    student_id = str(data.get("student_id", "")).strip()
+    teacher_name = str(data.get("teacher_name", "")).strip()
+    session = str(data.get("session", "")).strip()
+    changes = filter_edit_changes(data.get("changes") or {})
+
+    if not student_id:
+        return jsonify({"success": False, "message": "student_id is required"}), 400
+    if not changes:
+        return jsonify({"success": False, "message": "No valid changes provided"}), 400
+
+    try:
+        student = students_col.find_one({"_id": ObjectId(student_id)})
+        if not student:
+            return jsonify({"success": False, "message": "Student not found"}), 404
+    except Exception:
+        return jsonify({"success": False, "message": "Invalid student_id"}), 400
+
+    original = {k: student.get(k, "") for k in changes.keys()}
+    snapshot = {
+        "student_name": student.get("student_name", ""),
+        "class_name": student.get("class_name", student.get("class", "")),
+        "rollno": student.get("rollno", ""),
+        "admission_no": student.get("admission_no", ""),
+        "photo_url": student.get("photo_url", "")
+    }
+    req_doc = {
+        "student_id": student_id,
+        "teacher_name": teacher_name,
+        "session": session,
+        "changes": changes,
+        "original": original,
+        "student_snapshot": snapshot,
+        "status": "pending",
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
+    ins = student_edit_requests_col.insert_one(req_doc)
+    return jsonify({"success": True, "request_id": str(ins.inserted_id)})
+
+
+@app.route("/student-edit-requests", methods=["GET"])
+def list_student_edit_requests():
+    status = str(request.args.get("status", "")).strip().lower()
+    session = str(request.args.get("session", "")).strip()
+    q = {}
+    if status:
+        q["status"] = status
+    if session:
+        q["session"] = session
+    rows = list(student_edit_requests_col.find(q).sort("created_at", -1))
+    for r in rows:
+        r["_id"] = str(r["_id"])
+    return jsonify({"success": True, "requests": rows})
+
+
+@app.route("/student-edit-requests/<req_id>", methods=["GET"])
+def get_student_edit_request(req_id):
+    try:
+        doc = student_edit_requests_col.find_one({"_id": ObjectId(req_id)})
+    except Exception:
+        doc = None
+    if not doc:
+        return jsonify({"success": False, "message": "Request not found"}), 404
+    doc["_id"] = str(doc["_id"])
+    return jsonify({"success": True, "request": doc})
+
+
+@app.route("/student-edit-requests/<req_id>/approve", methods=["POST"])
+def approve_student_edit_request(req_id):
+    try:
+        doc = student_edit_requests_col.find_one({"_id": ObjectId(req_id)})
+    except Exception:
+        doc = None
+    if not doc:
+        return jsonify({"success": False, "message": "Request not found"}), 404
+    if doc.get("status") != "pending":
+        return jsonify({"success": False, "message": "Request already processed"}), 400
+
+    changes = filter_edit_changes(doc.get("changes") or {})
+    if not changes:
+        return jsonify({"success": False, "message": "No valid changes to apply"}), 400
+
+    # Handle photo upload from data URL if provided
+    if PHOTO_DATA_FIELD in changes and changes.get(PHOTO_DATA_FIELD):
+        try:
+            res = cloudinary.uploader.upload(changes[PHOTO_DATA_FIELD], folder="school_students")
+            changes["photo_url"] = res.get("secure_url", "")
+        except Exception as e:
+            return jsonify({"success": False, "message": f"Photo upload failed: {e}"}), 400
+        changes.pop(PHOTO_DATA_FIELD, None)
+
+    students_col.update_one({"_id": ObjectId(doc["student_id"])}, {"$set": changes})
+    student_edit_requests_col.update_one(
+        {"_id": ObjectId(req_id)},
+        {"$set": {"status": "approved", "reviewed_at": datetime.utcnow(), "updated_at": datetime.utcnow()}}
+    )
+    return jsonify({"success": True})
+
+
+@app.route("/student-edit-requests/<req_id>/reject", methods=["POST"])
+def reject_student_edit_request(req_id):
+    try:
+        doc = student_edit_requests_col.find_one({"_id": ObjectId(req_id)})
+    except Exception:
+        doc = None
+    if not doc:
+        return jsonify({"success": False, "message": "Request not found"}), 404
+    if doc.get("status") != "pending":
+        return jsonify({"success": False, "message": "Request already processed"}), 400
+
+    student_edit_requests_col.update_one(
+        {"_id": ObjectId(req_id)},
+        {"$set": {"status": "rejected", "reviewed_at": datetime.utcnow(), "updated_at": datetime.utcnow()}}
+    )
+    return jsonify({"success": True})
 
 @app.route("/students/<id>", methods=["GET"])
 def get_student(id):
