@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -13,6 +13,9 @@ import tempfile
 import os
 import zipfile
 import shutil
+import hashlib
+import hmac
+import math
 
 app = Flask(__name__)
 CORS(app)
@@ -31,6 +34,132 @@ db = client["school_erp"]
 students_col = db["students"]
 teachers_col = db["teachers"]
 student_edit_requests_col = db["student_edit_requests"]
+teacher_attendance_col = db["teacher_attendance"]
+
+IST_OFFSET = timedelta(hours=5, minutes=30)
+QR_ROTATE_SECONDS = 30
+QR_SECRET = os.environ.get("TEACHER_ATTENDANCE_QR_SECRET", "teacher-attendance-secret")
+ATTENDANCE_MIN_OUT_MINUTES = int(os.environ.get("ATTENDANCE_MIN_OUT_MINUTES", "30"))
+ATTENDANCE_SITE_LAT = os.environ.get("ATTENDANCE_SITE_LAT", "").strip()
+ATTENDANCE_SITE_LON = os.environ.get("ATTENDANCE_SITE_LON", "").strip()
+ATTENDANCE_SITE_RADIUS_M = float(os.environ.get("ATTENDANCE_SITE_RADIUS_M", "300") or 300)
+ATTENDANCE_REQUIRE_GPS = os.environ.get("ATTENDANCE_REQUIRE_GPS", "0").strip().lower() in {"1", "true", "yes", "on", "y"}
+ATTENDANCE_LATE_AFTER = os.environ.get("ATTENDANCE_LATE_AFTER", "09:15").strip()
+TEXTBEE_ENABLED = os.environ.get("TEXTBEE_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on", "y"}
+TEXTBEE_API_BASE = os.environ.get("TEXTBEE_API_BASE", "https://api.textbee.dev").strip().rstrip("/")
+TEXTBEE_DEVICE_ID = os.environ.get("TEXTBEE_DEVICE_ID", "").strip()
+TEXTBEE_API_KEY = os.environ.get("TEXTBEE_API_KEY", "").strip()
+
+
+def now_ist():
+    return datetime.utcnow() + IST_OFFSET
+
+
+def to_iso(dt):
+    return dt.isoformat(timespec="seconds")
+
+
+def parse_hhmm(value, fallback_h=9, fallback_m=15):
+    text = str(value or "").strip()
+    try:
+        parts = text.split(":")
+        if len(parts) >= 2:
+            h = int(parts[0])
+            m = int(parts[1])
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return h, m
+    except Exception:
+        pass
+    return fallback_h, fallback_m
+
+
+def qr_slot_for(dt):
+    return int(dt.timestamp() // QR_ROTATE_SECONDS)
+
+
+def qr_signature(slot):
+    msg = str(slot).encode("utf-8")
+    key = QR_SECRET.encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()[:12]
+
+
+def build_qr_code(slot):
+    return f"TCH-ATTN|{slot}|{qr_signature(slot)}"
+
+
+def verify_qr_code(code):
+    parts = str(code or "").strip().split("|")
+    if len(parts) != 3 or parts[0] != "TCH-ATTN":
+        return False
+    try:
+        slot = int(parts[1])
+    except Exception:
+        return False
+    sig = parts[2].strip()
+    now_slot = qr_slot_for(now_ist())
+    for probe in (now_slot - 1, now_slot, now_slot + 1):
+        if slot == probe and hmac.compare_digest(sig, qr_signature(probe)):
+            return True
+    return False
+
+
+def distance_meters(lat1, lon1, lat2, lon2):
+    # Haversine formula
+    r = 6371000.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def normalize_phone_for_sms(phone):
+    p = str(phone or "").strip()
+    if not p:
+        return ""
+    digits = "".join(ch for ch in p if ch.isdigit() or ch == "+")
+    if digits.startswith("+"):
+        return digits
+    num = "".join(ch for ch in digits if ch.isdigit())
+    if len(num) == 10:
+        return "+91" + num
+    if len(num) == 12 and num.startswith("91"):
+        return "+" + num
+    if len(num) > 0:
+        return "+" + num
+    return ""
+
+
+def send_textbee_sms(recipient, message):
+    if not TEXTBEE_ENABLED:
+        return {"sent": False, "reason": "disabled"}
+    if not TEXTBEE_DEVICE_ID or not TEXTBEE_API_KEY:
+        return {"sent": False, "reason": "missing_config"}
+    raw = str(recipient or "").strip()
+    to = normalize_phone_for_sms(raw)
+    if not to:
+        return {"sent": False, "reason": "invalid_phone", "recipient_raw": raw}
+    url = f"{TEXTBEE_API_BASE}/api/v1/gateway/devices/{TEXTBEE_DEVICE_ID}/send-sms"
+    headers = {
+        "x-api-key": TEXTBEE_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "recipients": [to],
+        "message": str(message or "").strip(),
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        ok = 200 <= resp.status_code < 300
+        data = {}
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw": resp.text[:500]}
+        return {"sent": ok, "status": resp.status_code, "response": data, "recipient": to, "recipient_raw": raw}
+    except Exception as ex:
+        return {"sent": False, "reason": str(ex), "recipient": to, "recipient_raw": raw}
 
 
 def to_bool(value):
@@ -862,6 +991,421 @@ def portal_get_student(student_id):
 
     except Exception as e:
         return jsonify({"success": False, "message": "Invalid ID"}), 400
+
+
+@app.route("/teacher-attendance/qr/current", methods=["GET"])
+def teacher_attendance_qr_current():
+    now = now_ist()
+    slot = qr_slot_for(now)
+    expires_in = QR_ROTATE_SECONDS - (int(now.timestamp()) % QR_ROTATE_SECONDS)
+    return jsonify({
+        "success": True,
+        "slot": slot,
+        "qr_code": build_qr_code(slot),
+        "expires_in": expires_in,
+        "generated_at": to_iso(now)
+    })
+
+
+@app.route("/teacher-attendance/mark", methods=["POST"])
+def teacher_attendance_mark():
+    data = request.json or {}
+    teacher_id_raw = str(data.get("teacher_id", "")).strip()
+    teacher_id = normalize_teacher_code(teacher_id_raw)
+    teacher_name = str(data.get("teacher_name", "")).strip()
+    qr_code = str(data.get("qr_code", "")).strip()
+    session = str(data.get("session", "")).strip()
+    device = str(data.get("device", "")).strip()
+
+    lat = data.get("lat", None)
+    lon = data.get("lon", None)
+
+    if not teacher_id_raw:
+        return jsonify({"success": False, "message": "teacher_id is required"}), 400
+    if not qr_code:
+        return jsonify({"success": False, "message": "qr_code is required"}), 400
+    if not verify_qr_code(qr_code):
+        return jsonify({"success": False, "message": "Invalid or expired QR code"}), 400
+
+    teacher = None
+    q_or = []
+    if teacher_id:
+        q_or.append({"teacher_code": teacher_id})
+    if teacher_id_raw:
+        q_or.append({"teacher_code": teacher_id_raw})
+        q_or.append({"employee_id": teacher_id_raw})
+    if q_or:
+        teacher = teachers_col.find_one({"$or": q_or})
+    if not teacher and ObjectId.is_valid(teacher_id_raw):
+        teacher = teachers_col.find_one({"_id": ObjectId(teacher_id_raw)})
+    if not teacher and teacher_name:
+        teacher = teachers_col.find_one({"teacher_name": {"$regex": f"^{teacher_name}$", "$options": "i"}})
+    if not teacher:
+        return jsonify({"success": False, "message": "Teacher not found"}), 404
+
+    resolved_teacher_code = normalize_teacher_code(teacher.get("teacher_code", "")) or teacher_id or teacher_id_raw
+    if not teacher_name:
+        teacher_name = str(teacher.get("teacher_name", "")).strip()
+    teacher_employee_id = str(teacher.get("employee_id", "")).strip()
+    teacher_mobile = str(teacher.get("mobile", "") or teacher.get("phone", "")).strip()
+    teacher_mongo_id = str(teacher.get("_id", "")).strip()
+    aliases = []
+    for a in [resolved_teacher_code, teacher_id_raw, teacher_employee_id, teacher_mongo_id]:
+        a = str(a or "").strip()
+        if a and a not in aliases:
+            aliases.append(a)
+
+    if lat is not None and lon is not None:
+        try:
+            lat = float(lat)
+            lon = float(lon)
+        except Exception:
+            return jsonify({"success": False, "message": "Invalid location coordinates"}), 400
+    else:
+        lat = None
+        lon = None
+
+    site_distance = None
+    if ATTENDANCE_SITE_LAT and ATTENDANCE_SITE_LON and lat is not None and lon is not None:
+        try:
+            site_lat = float(ATTENDANCE_SITE_LAT)
+            site_lon = float(ATTENDANCE_SITE_LON)
+            site_distance = distance_meters(site_lat, site_lon, lat, lon)
+        except Exception:
+            site_distance = None
+
+    if ATTENDANCE_REQUIRE_GPS:
+        if lat is None or lon is None:
+            return jsonify({"success": False, "message": "Location is required"}), 400
+        if site_distance is not None and site_distance > ATTENDANCE_SITE_RADIUS_M:
+            return jsonify({
+                "success": False,
+                "message": f"Outside allowed attendance area ({int(site_distance)}m)"
+            }), 400
+
+    now = now_ist()
+    today = now.date().isoformat()
+    rec = teacher_attendance_col.find_one({"teacher_id": teacher_id, "date": today})
+
+    late_h, late_m = parse_hhmm(ATTENDANCE_LATE_AFTER, 9, 15)
+    late_cutoff = now.replace(hour=late_h, minute=late_m, second=0, microsecond=0)
+
+    event = "IN"
+    if rec and rec.get("in_time"):
+        event = "OUT"
+    if rec and rec.get("in_time") and rec.get("out_time"):
+        return jsonify({
+            "success": False,
+            "message": "Attendance already marked for both IN and OUT today",
+            "code": "ALREADY_MARKED"
+        }), 409
+    if event == "OUT":
+        in_time = rec.get("in_time") if rec else None
+        if isinstance(in_time, datetime):
+            elapsed_minutes = max(0, int((now - in_time).total_seconds() // 60))
+            if elapsed_minutes < ATTENDANCE_MIN_OUT_MINUTES:
+                wait_minutes = ATTENDANCE_MIN_OUT_MINUTES - elapsed_minutes
+                return jsonify({
+                    "success": False,
+                    "message": f"OUT attendance allowed after {ATTENDANCE_MIN_OUT_MINUTES} minutes from IN. Please wait {wait_minutes} minute(s).",
+                    "code": "OUT_TOO_EARLY",
+                    "in_time": to_iso(in_time),
+                    "wait_minutes": wait_minutes
+                }), 409
+
+    payload = {
+        "teacher_id": resolved_teacher_code,
+        "teacher_name": teacher_name,
+        "teacher_employee_id": teacher_employee_id,
+        "teacher_mongo_id": teacher_mongo_id,
+        "teacher_aliases": aliases,
+        "session": session,
+        "date": today,
+        "updated_at": now,
+    }
+    if device:
+        payload["device"] = device
+    if lat is not None and lon is not None:
+        payload["last_lat"] = lat
+        payload["last_lon"] = lon
+    if site_distance is not None:
+        payload["site_distance_m"] = round(site_distance, 2)
+
+    if event == "IN":
+        payload["in_time"] = now
+        payload["late_minutes"] = max(0, int((now - late_cutoff).total_seconds() // 60))
+    else:
+        payload["out_time"] = now
+        in_time = rec.get("in_time")
+        if isinstance(in_time, datetime):
+            minutes = max(0, int((now - in_time).total_seconds() // 60))
+            payload["working_minutes"] = minutes
+
+    teacher_attendance_col.update_one(
+        {"teacher_id": resolved_teacher_code, "date": today},
+        {"$set": payload, "$setOnInsert": {"created_at": now}},
+        upsert=True
+    )
+
+    saved = teacher_attendance_col.find_one({"teacher_id": resolved_teacher_code, "date": today}) or {}
+    result = {
+        "teacher_id": resolved_teacher_code,
+        "teacher_name": saved.get("teacher_name", teacher_name),
+        "date": today,
+        "event": event,
+        "in_time": to_iso(saved["in_time"]) if isinstance(saved.get("in_time"), datetime) else "",
+        "out_time": to_iso(saved["out_time"]) if isinstance(saved.get("out_time"), datetime) else "",
+        "late_minutes": int(saved.get("late_minutes", 0) or 0),
+        "working_minutes": int(saved.get("working_minutes", 0) or 0),
+        "site_distance_m": saved.get("site_distance_m"),
+    }
+
+    sms_text = (
+        f"Dear {result['teacher_name']}, your attendance ({result['event']}) "
+        f"has been marked on {result['date']}. "
+        f"IN: {result['in_time'] or '-'} OUT: {result['out_time'] or '-'}."
+    )
+    sms_result = send_textbee_sms(teacher_mobile, sms_text)
+
+    return jsonify({"success": True, "attendance": result, "sms": sms_result})
+
+
+@app.route("/teacher-attendance/history", methods=["GET"])
+def teacher_attendance_history():
+    teacher_id_raw = str(request.args.get("teacher_id", "")).strip()
+    teacher_id = normalize_teacher_code(teacher_id_raw)
+    teacher_name = str(request.args.get("teacher_name", "")).strip()
+    limit = request.args.get("limit", "20")
+    try:
+        limit_n = max(1, min(100, int(limit)))
+    except Exception:
+        limit_n = 20
+
+    if not teacher_id_raw and not teacher_name:
+        return jsonify({"success": False, "message": "teacher_id is required"}), 400
+
+    q_or = []
+    for v in [teacher_id_raw, teacher_id]:
+        v = str(v or "").strip()
+        if not v:
+            continue
+        q_or.append({"teacher_id": v})
+        q_or.append({"teacher_aliases": v})
+        q_or.append({"teacher_employee_id": v})
+        q_or.append({"teacher_mongo_id": v})
+    if teacher_name:
+        q_or.append({"teacher_name": {"$regex": f"^{teacher_name}$", "$options": "i"}})
+
+    query = {"$or": q_or} if q_or else {}
+    rows = list(
+        teacher_attendance_col.find(query)
+        .sort("date", -1)
+        .limit(limit_n)
+    )
+    out = []
+    for r in rows:
+        out.append({
+            "id": str(r.get("_id", "")),
+            "teacher_id": r.get("teacher_id", ""),
+            "teacher_name": r.get("teacher_name", ""),
+            "date": r.get("date", ""),
+            "session": r.get("session", ""),
+            "in_time": to_iso(r["in_time"]) if isinstance(r.get("in_time"), datetime) else "",
+            "out_time": to_iso(r["out_time"]) if isinstance(r.get("out_time"), datetime) else "",
+            "late_minutes": int(r.get("late_minutes", 0) or 0),
+            "working_minutes": int(r.get("working_minutes", 0) or 0),
+            "site_distance_m": r.get("site_distance_m"),
+            "device": r.get("device", ""),
+        })
+    return jsonify({"success": True, "history": out})
+
+
+@app.route("/teacher-attendance/admin/list", methods=["GET"])
+def teacher_attendance_admin_list():
+    date_from = str(request.args.get("date_from", "")).strip()
+    date_to = str(request.args.get("date_to", "")).strip()
+    teacher_id_raw = str(request.args.get("teacher_id", "")).strip()
+    teacher_id = normalize_teacher_code(teacher_id_raw)
+    teacher_name = str(request.args.get("teacher_name", "")).strip()
+    limit = request.args.get("limit", "500")
+    try:
+        limit_n = max(1, min(5000, int(limit)))
+    except Exception:
+        limit_n = 500
+
+    query = {}
+    if date_from or date_to:
+        query["date"] = {}
+        if date_from:
+            query["date"]["$gte"] = date_from
+        if date_to:
+            query["date"]["$lte"] = date_to
+        if not query["date"]:
+            query.pop("date", None)
+
+    q_or = []
+    for v in [teacher_id_raw, teacher_id]:
+        v = str(v or "").strip()
+        if not v:
+            continue
+        q_or.append({"teacher_id": v})
+        q_or.append({"teacher_aliases": v})
+        q_or.append({"teacher_employee_id": v})
+        q_or.append({"teacher_mongo_id": v})
+    if teacher_name:
+        q_or.append({"teacher_name": {"$regex": teacher_name, "$options": "i"}})
+    if q_or:
+        query["$or"] = q_or
+
+    rows = list(
+        teacher_attendance_col.find(query)
+        .sort([("date", -1), ("updated_at", -1)])
+        .limit(limit_n)
+    )
+    out = []
+    for r in rows:
+        out.append({
+            "id": str(r.get("_id", "")),
+            "teacher_id": r.get("teacher_id", ""),
+            "teacher_name": r.get("teacher_name", ""),
+            "date": r.get("date", ""),
+            "session": r.get("session", ""),
+            "in_time": to_iso(r["in_time"]) if isinstance(r.get("in_time"), datetime) else "",
+            "out_time": to_iso(r["out_time"]) if isinstance(r.get("out_time"), datetime) else "",
+            "late_minutes": int(r.get("late_minutes", 0) or 0),
+            "working_minutes": int(r.get("working_minutes", 0) or 0),
+            "site_distance_m": r.get("site_distance_m"),
+            "device": r.get("device", ""),
+        })
+    return jsonify({"success": True, "rows": out, "count": len(out)})
+
+
+@app.route("/teacher-attendance/admin/edit", methods=["POST"])
+def teacher_attendance_admin_edit():
+    data = request.json or {}
+    teacher_id_raw = str(data.get("teacher_id", "")).strip()
+    teacher_id = normalize_teacher_code(teacher_id_raw)
+    date = str(data.get("date", "")).strip()
+    in_time = str(data.get("in_time", "")).strip()
+    out_time = str(data.get("out_time", "")).strip()
+    if not teacher_id_raw or not date:
+        return jsonify({"success": False, "message": "teacher_id and date are required"}), 400
+
+    q_or = []
+    for v in [teacher_id_raw, teacher_id]:
+        v = str(v or "").strip()
+        if not v:
+            continue
+        q_or.append({"teacher_id": v})
+        q_or.append({"teacher_aliases": v})
+        q_or.append({"teacher_employee_id": v})
+        q_or.append({"teacher_mongo_id": v})
+    query = {"date": date, "$or": q_or}
+
+    rec = teacher_attendance_col.find_one(query)
+    if not rec:
+        return jsonify({"success": False, "message": "Attendance record not found"}), 404
+
+    tz = IST
+    updates = {"updated_at": now_ist()}
+    in_dt = None
+    out_dt = None
+    if in_time:
+        try:
+            in_dt = datetime.strptime(f"{date} {in_time}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+            updates["in_time"] = in_dt
+        except Exception:
+            return jsonify({"success": False, "message": "Invalid in_time format. Use HH:MM"}), 400
+    else:
+        updates["in_time"] = None
+
+    if out_time:
+        try:
+            out_dt = datetime.strptime(f"{date} {out_time}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+            updates["out_time"] = out_dt
+        except Exception:
+            return jsonify({"success": False, "message": "Invalid out_time format. Use HH:MM"}), 400
+    else:
+        updates["out_time"] = None
+
+    if in_dt and out_dt and out_dt < in_dt:
+        return jsonify({"success": False, "message": "OUT time cannot be earlier than IN time"}), 400
+
+    late_h, late_m = parse_hhmm(ATTENDANCE_LATE_AFTER, 9, 15)
+    if in_dt:
+        late_cutoff = in_dt.replace(hour=late_h, minute=late_m, second=0, microsecond=0)
+        updates["late_minutes"] = max(0, int((in_dt - late_cutoff).total_seconds() // 60))
+    else:
+        updates["late_minutes"] = 0
+
+    if in_dt and out_dt:
+        updates["working_minutes"] = max(0, int((out_dt - in_dt).total_seconds() // 60))
+    else:
+        updates["working_minutes"] = 0
+
+    teacher_attendance_col.update_one({"_id": rec["_id"]}, {"$set": updates})
+    saved = teacher_attendance_col.find_one({"_id": rec["_id"]}) or {}
+    return jsonify({
+        "success": True,
+        "record": {
+            "teacher_id": saved.get("teacher_id", ""),
+            "teacher_name": saved.get("teacher_name", ""),
+            "date": saved.get("date", ""),
+            "in_time": to_iso(saved["in_time"]) if isinstance(saved.get("in_time"), datetime) else "",
+            "out_time": to_iso(saved["out_time"]) if isinstance(saved.get("out_time"), datetime) else "",
+            "late_minutes": int(saved.get("late_minutes", 0) or 0),
+            "working_minutes": int(saved.get("working_minutes", 0) or 0),
+        }
+    })
+
+
+@app.route("/teacher-attendance/admin/delete", methods=["POST"])
+def teacher_attendance_admin_delete():
+    data = request.json or {}
+    teacher_id_raw = str(data.get("teacher_id", "")).strip()
+    teacher_id = normalize_teacher_code(teacher_id_raw)
+    date = str(data.get("date", "")).strip()
+    if not teacher_id_raw or not date:
+        return jsonify({"success": False, "message": "teacher_id and date are required"}), 400
+
+    q_or = []
+    for v in [teacher_id_raw, teacher_id]:
+        v = str(v or "").strip()
+        if not v:
+            continue
+        q_or.append({"teacher_id": v})
+        q_or.append({"teacher_aliases": v})
+        q_or.append({"teacher_employee_id": v})
+        q_or.append({"teacher_mongo_id": v})
+
+    query = {"date": date, "$or": q_or}
+    rec = teacher_attendance_col.find_one(query)
+    if not rec:
+        return jsonify({"success": False, "message": "Attendance record not found"}), 404
+
+    teacher_attendance_col.delete_one({"_id": rec["_id"]})
+    return jsonify({"success": True, "message": "Attendance deleted"})
+
+
+@app.route("/teacher-attendance/send-sms", methods=["POST"])
+def teacher_attendance_send_sms():
+    data = request.json or {}
+    teacher_name = str(data.get("teacher_name", "")).strip() or "Teacher"
+    teacher_mobile = str(data.get("mobile", "")).strip()
+    event = str(data.get("event", "")).strip().upper() or "IN"
+    date = str(data.get("date", "")).strip() or now_ist().date().isoformat()
+    in_time = str(data.get("in_time", "")).strip() or "-"
+    out_time = str(data.get("out_time", "")).strip() or "-"
+
+    if not teacher_mobile:
+        return jsonify({"success": False, "message": "mobile is required"}), 400
+
+    msg = (
+        f"Dear {teacher_name}, your attendance ({event}) has been marked on {date}. "
+        f"IN: {in_time} OUT: {out_time}."
+    )
+    sms_result = send_textbee_sms(teacher_mobile, msg)
+    return jsonify({"success": bool(sms_result.get("sent")), "sms": sms_result})
 
 # ================= HOME =================
 @app.route("/", methods=["GET"])
