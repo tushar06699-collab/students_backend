@@ -16,6 +16,7 @@ import shutil
 import hashlib
 import hmac
 import math
+import random
 
 app = Flask(__name__)
 CORS(app)
@@ -35,6 +36,8 @@ students_col = db["students"]
 teachers_col = db["teachers"]
 student_edit_requests_col = db["student_edit_requests"]
 teacher_attendance_col = db["teacher_attendance"]
+
+students_col.create_index("regno", unique=True, sparse=True)
 
 IST_OFFSET = timedelta(hours=5, minutes=30)
 QR_ROTATE_SECONDS = 30
@@ -255,6 +258,31 @@ def normalize_photo_id(value):
     return normalize_admission_no(value)
 
 
+def generate_student_regno(reserved=None):
+    """Create a unique 6 digit student registration number."""
+    if reserved is None:
+        reserved = set()
+    for _ in range(100):
+        regno = str(random.randint(100000, 999999))
+        if regno not in reserved and not students_col.find_one({"regno": regno}, {"_id": 1}):
+            reserved.add(regno)
+            return regno
+    raise RuntimeError("Unable to generate unique registration number")
+
+
+def ensure_student_regno(student):
+    if not student:
+        return student
+    regno = str(student.get("regno", "")).strip()
+    if len(regno) == 6 and regno.isdigit():
+        student["regno"] = regno
+        return student
+    regno = generate_student_regno()
+    students_col.update_one({"_id": student["_id"]}, {"$set": {"regno": regno}})
+    student["regno"] = regno
+    return student
+
+
 def normalize_teacher_code(value):
     """Normalize teacher code to 4 digits when numeric."""
     if value is None:
@@ -334,6 +362,7 @@ def import_excel_with_images():
             image_map = build_zip_image_map(extract_dir)
 
         students = []
+        reserved_regnos = set()
 
         for _, row in df.iterrows():
             admission_no = normalize_admission_no(row.get("admission_no", ""))
@@ -354,6 +383,7 @@ def import_excel_with_images():
                     print(f"Photo upload error for admission_no={admission_no}:", e)
 
             students.append({
+                "regno": generate_student_regno(reserved_regnos),
                 "photo_id": photo_id,
                 "admission_no": admission_no,
                 "rollno": normalize_admission_no(row.get("rollno", "")),
@@ -403,6 +433,7 @@ def add_student():
         photo_url = res["secure_url"]
 
     student = {
+        "regno": generate_student_regno(),
         "admission_no": form.get("admission_no", ""),
         "photo_id": form.get("photo_id", ""),
         "rollno": form.get("rollno", ""),
@@ -423,7 +454,7 @@ def add_student():
     }
 
     students_col.insert_one(student)
-    return jsonify({"message": "Student added successfully"})
+    return jsonify({"message": "Student added successfully", "regno": student["regno"]})
 
 # ================= IMPORT EXCEL (IMAGE URL COLUMN) =================
 @app.route("/import_excel", methods=["POST"])
@@ -435,11 +466,13 @@ def import_excel():
     df = pd.read_excel(file)
 
     students = []
+    reserved_regnos = set()
 
     for _, row in df.iterrows():
         cloud_img = upload_to_cloudinary(row.get("photo_url", ""))
 
         students.append({
+            "regno": generate_student_regno(reserved_regnos),
             "photo_id": normalize_photo_id(row.get("photo_id", "")),
             "admission_no": str(row.get("admission_no", "")).strip(),
             "rollno": str(row.get("rollno", "")).strip(),
@@ -477,6 +510,7 @@ def get_student_by_admission(admission_no):
     if not student:
         return jsonify({"success": False, "message": "Student not found"}), 404
 
+    ensure_student_regno(student)
     student["_id"] = str(student["_id"])
     return jsonify({"success": True, "student": student})
 
@@ -492,6 +526,7 @@ def get_students():
     # Primary: exact session filter when provided.
     # Compatibility fallback: many legacy rows may have missing/old session values.
     students = []
+    reserved_regnos = set()
     if session:
         q_session = dict(q)
         variants = session_variants(session)
@@ -509,6 +544,7 @@ def get_students():
         students = list(students_col.find(q))
 
     for s in students:
+        ensure_student_regno(s)
         s["_id"] = str(s["_id"])
     return jsonify(students)
 
@@ -542,6 +578,8 @@ def update_student(id):
             update_data = request.json or {}
             if "new_admission" in update_data:
                 update_data["new_admission"] = to_bool(update_data["new_admission"])
+
+        update_data.pop("regno", None)
 
         students_col.update_one(
             {"_id": ObjectId(id)},
@@ -701,6 +739,7 @@ def get_student(id):
         if not student:
             return jsonify({"error": "Student not found"}), 404
 
+        ensure_student_regno(student)
         student["_id"] = str(student["_id"])
         return jsonify(student)
     except:
@@ -971,12 +1010,14 @@ def portal_get_student(student_id):
         if not student:
             return jsonify({"success": False, "message": "Student not found"}), 404
 
+        ensure_student_regno(student)
         student["_id"] = str(student["_id"])
 
         return jsonify({
             "success": True,
             "student": {
                 "id": student["_id"],
+                "regno": student.get("regno", ""),
                 "name": student.get("student_name", ""),
                 "class_name": student.get("class_name", ""),
                 "section": student.get("section", ""),
