@@ -19,7 +19,36 @@ import math
 import random
 
 app = Flask(__name__)
-CORS(app)
+CORS(
+    app,
+    resources={r"/*": {"origins": [
+        "http://127.0.0.1:5500",
+        "http://127.0.0.1:5501",
+        "http://localhost:5500",
+        "http://localhost:5501",
+        "https://student-frontend-mocha.vercel.app",
+        "https://student-backend-117372286918.asia-south1.run.app"
+    ]}},
+    supports_credentials=False
+)
+
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get("Origin", "")
+    allowed_origins = {
+        "http://127.0.0.1:5500",
+        "http://127.0.0.1:5501",
+        "http://localhost:5500",
+        "http://localhost:5501",
+        "https://student-frontend-mocha.vercel.app",
+    }
+    if origin in allowed_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    return response
 
 # ================= CLOUDINARY CONFIG =================
 cloudinary.config(
@@ -258,6 +287,11 @@ def normalize_photo_id(value):
     return normalize_admission_no(value)
 
 
+def normalize_photono(value):
+    """Normalize photono similar to admission numbers."""
+    return normalize_admission_no(value)
+
+
 def generate_student_regno(reserved=None):
     """Create a unique 6 digit student registration number."""
     if reserved is None:
@@ -366,10 +400,15 @@ def import_excel_with_images():
 
         for _, row in df.iterrows():
             admission_no = normalize_admission_no(row.get("admission_no", ""))
+            photono = normalize_photono(row.get("photono", row.get("photo_no", row.get("photo_id", ""))))
             photo_id = normalize_photo_id(row.get("photo_id", ""))
             photo_url = ""
 
-            img_path = image_map.get(photo_id) or image_map.get(admission_no)
+            img_path = (
+                image_map.get(photono)
+                or image_map.get(photo_id)
+                or image_map.get(admission_no)
+            )
             if img_path and os.path.exists(img_path):
                 try:
                     res = cloudinary.uploader.upload(
@@ -380,10 +419,11 @@ def import_excel_with_images():
                     if photo_url:
                         matched_photos += 1
                 except Exception as e:
-                    print(f"Photo upload error for admission_no={admission_no}:", e)
+                    print(f"Photo upload error for admission_no={admission_no}, photono={photono}:", e)
 
             students.append({
                 "regno": generate_student_regno(reserved_regnos),
+                "photono": photono,
                 "photo_id": photo_id,
                 "admission_no": admission_no,
                 "rollno": normalize_admission_no(row.get("rollno", "")),
@@ -435,6 +475,7 @@ def add_student():
     student = {
         "regno": generate_student_regno(),
         "admission_no": form.get("admission_no", ""),
+        "photono": form.get("photono", ""),
         "photo_id": form.get("photo_id", ""),
         "rollno": form.get("rollno", ""),
         "panno": form.get("panno", ""),
@@ -473,6 +514,7 @@ def import_excel():
 
         students.append({
             "regno": generate_student_regno(reserved_regnos),
+            "photono": normalize_photono(row.get("photono", row.get("photo_no", row.get("photo_id", "")))),
             "photo_id": normalize_photo_id(row.get("photo_id", "")),
             "admission_no": str(row.get("admission_no", "")).strip(),
             "rollno": str(row.get("rollno", "")).strip(),
@@ -592,7 +634,7 @@ def update_student(id):
 
 # ================= STUDENT EDIT REQUESTS =================
 EDITABLE_FIELDS = {
-    "photo_id", "admission_no", "rollno", "panno", "student_name", "father_name",
+    "photono", "photo_id", "admission_no", "rollno", "panno", "student_name", "father_name",
     "mother_name", "class_name", "section", "gender", "dob", "session",
     "aadharno", "parent_mobile", "parent_email", "address", "photo_url", "new_admission"
 }
@@ -987,7 +1029,7 @@ def download_format():
     ws.title = "Student Import Format"
 
     headers = [
-        "photo_id", "admission_no", "rollno", "panno", "student_name",
+        "photono", "photo_id", "admission_no", "rollno", "panno", "student_name",
         "father_name", "mother_name", "class_name", "section",
         "dob", "gender", "aadharno",
         "parent_mobile", "parent_email", "address",
